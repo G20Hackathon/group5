@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 
 class OSMMapPage extends StatefulWidget {
   const OSMMapPage({super.key});
@@ -15,9 +17,14 @@ class _OSMMapPageState extends State<OSMMapPage> {
 
   Position? _currentPosition;
   LatLng? _destination;
+  List<LatLng> _polylinePoints = [];
 
   final TextEditingController _latController = TextEditingController();
   final TextEditingController _lngController = TextEditingController();
+
+  // 🔑 Replace with your OpenRouteService API key
+  final String orsApiKey =
+      'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjY2MjRmYzgwZjBkNjQxZDRhNjdkZjU4ZWVkOThkNTY2IiwiaCI6Im11cm11cjY0In0=';
 
   @override
   void initState() {
@@ -27,37 +34,14 @@ class _OSMMapPageState extends State<OSMMapPage> {
 
   Future<void> _initLocation() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Location services are disabled.')),
-        );
-      }
-      return;
-    }
+    if (!serviceEnabled) return;
 
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Location permission denied.')),
-          );
-        }
-        return;
-      }
+      if (permission == LocationPermission.denied) return;
     }
-    if (permission == LocationPermission.deniedForever) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Location permissions are permanently denied.'),
-          ),
-        );
-      }
-      return;
-    }
+    if (permission == LocationPermission.deniedForever) return;
 
     final pos = await Geolocator.getCurrentPosition(
       desiredAccuracy: LocationAccuracy.high,
@@ -67,43 +51,71 @@ class _OSMMapPageState extends State<OSMMapPage> {
       _currentPosition = pos;
     });
 
-    // Center the map on current location
     _mapController.move(LatLng(pos.latitude, pos.longitude), 15);
+  }
+
+  Future<List<LatLng>> fetchRoute(LatLng origin, LatLng destination) async {
+    final url = Uri.parse(
+      'https://api.openrouteservice.org/v2/directions/driving-car?api_key=$orsApiKey&start=${origin.longitude},${origin.latitude}&end=${destination.longitude},${destination.latitude}',
+    );
+    final response = await http.get(url);
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      final coords = data['features'][0]['geometry']['coordinates'] as List;
+      return coords
+          .map((point) => LatLng(point[1] as double, point[0] as double))
+          .toList();
+    } else {
+      throw Exception('Failed to fetch route: ${response.body}');
+    }
+  }
+
+  void _setDestination(LatLng dest) async {
+    if (_currentPosition == null) return;
+
+    setState(() {
+      _destination = dest;
+      _polylinePoints = [];
+    });
+
+    final origin = LatLng(
+      _currentPosition!.latitude,
+      _currentPosition!.longitude,
+    );
+
+    try {
+      final route = await fetchRoute(origin, dest);
+      setState(() {
+        _polylinePoints = route;
+      });
+
+      // Fit bounds
+      final bounds = LatLngBounds.fromPoints([origin, dest]);
+      _mapController.fitCamera(
+        CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(60)),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error fetching route: $e')));
+      }
+    }
   }
 
   void _setDestinationFromInputs() {
     final lat = double.tryParse(_latController.text.trim());
     final lng = double.tryParse(_lngController.text.trim());
-
-    if (lat == null || lng == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter valid numbers for lat & lng.')),
-      );
-      return;
-    }
-
-    setState(() {
-      _destination = LatLng(lat, lng);
-    });
-
-    // If we have both points, fit bounds nicely
-    if (_currentPosition != null) {
-      final origin = LatLng(
-        _currentPosition!.latitude,
-        _currentPosition!.longitude,
-      );
-      final bounds = LatLngBounds.fromPoints([origin, _destination!]);
-      _mapController.fitCamera(
-        CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(60)),
-      );
-    }
+    if (lat == null || lng == null) return;
+    _setDestination(LatLng(lat, lng));
   }
 
   @override
   Widget build(BuildContext context) {
-    final LatLng initialCenter = _currentPosition != null
+    final initialCenter = _currentPosition != null
         ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
-        : const LatLng(-26.2041, 28.0473); // Johannesburg as a fallback
+        : const LatLng(-26.2041, 28.0473); // fallback
 
     final markers = <Marker>[
       if (_currentPosition != null)
@@ -125,12 +137,6 @@ class _OSMMapPageState extends State<OSMMapPage> {
         ),
     ];
 
-    final polylinePoints = <LatLng>[
-      if (_currentPosition != null)
-        LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-      if (_destination != null) _destination!,
-    ];
-
     return Scaffold(
       body: Stack(
         children: [
@@ -142,29 +148,28 @@ class _OSMMapPageState extends State<OSMMapPage> {
               interactionOptions: const InteractionOptions(
                 flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
               ),
-              // 👇 NEW: allow tap to set destination
-              onTap: (tapPosition, point) {
-                setState(() {
-                  _destination = point;
-                });
+              onTap: (tapPos, point) {
+                _setDestination(point);
               },
             ),
             children: [
-              // OpenStreetMap tiles
               TileLayer(
                 urlTemplate:
                     "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                 subdomains: const ['a', 'b', 'c'],
                 userAgentPackageName: 'com.example.app',
               ),
-              // Polyline (straight line between origin & destination)
-              if (polylinePoints.length == 2)
+              if (_polylinePoints.isNotEmpty)
                 PolylineLayer(
-                  polylines: [Polyline(points: polylinePoints, strokeWidth: 5)],
+                  polylines: [
+                    Polyline(
+                      points: _polylinePoints,
+                      color: Colors.blue,
+                      strokeWidth: 5,
+                    ),
+                  ],
                 ),
-              // Markers
               MarkerLayer(markers: markers),
-              // OSM attribution (required by OSM policy)
               Align(
                 alignment: Alignment.bottomRight,
                 child: Padding(
